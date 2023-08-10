@@ -1,0 +1,23 @@
+/* style.css */
+#title {
+    font-family: Arial, sans-serif;
+    color: #333;
+}
+
+#subtitle {
+    font-family: Arial, sans-serif;
+    color: #666;
+}
+
+#ticker {
+    padding: 10px;
+    border-radius: 5px;
+    border: 1px solid #ccc;
+}
+
+#bollinger, #adx, #mfi, #flow {
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+    border-radius: 5px;
+    padding: 10px;
+    background-color: #fff;
+}
