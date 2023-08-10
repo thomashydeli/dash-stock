@@ -4,10 +4,8 @@ import numpy as np
 import pandas as pd
 from pytz import timezone
 from datetime import datetime, timedelta
-from pandas_datareader import data as web
 from plotly import graph_objects as go
 from plotly.subplots import make_subplots
-from scipy.stats import zscore
 
 import dash
 import dash_core_components as dcc
@@ -16,103 +14,23 @@ from dash.dependencies import Input, Output, State
 import base64
 import json
 
-def main(ticker):
-    data=web.DataReader(
-        ticker,'yahoo',start='2022-06-01'
-    )
+from utils.data import get_data
 
-    def get_adx(df, rate=20):
-        high,low,close=(df['High'],df['Low'],df['Close'])
-        plus_dm = high.diff()
-        minus_dm = low.diff()
-        plus_dm[plus_dm < 0] = 0
-        minus_dm[minus_dm > 0] = 0
+import threading
 
-        tr1 = pd.DataFrame(high - low)
-        tr2 = pd.DataFrame(abs(high - close.shift(1)))
-        tr3 = pd.DataFrame(abs(low - close.shift(1)))
-        frames = [tr1, tr2, tr3]
-        tr = pd.concat(frames, axis = 1, join = 'inner').max(axis = 1)
-        atr = tr.rolling(rate).mean()
-
-        plus_di = 100 * (plus_dm.ewm(alpha = 1/rate).mean() / atr)
-        minus_di = abs(100 * (minus_dm.ewm(alpha = 1/rate).mean() / atr))
-        dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di)) * 100
-        adx = ((dx.shift(1) * (rate - 1)) + dx) / rate
-        adx_smooth = adx.ewm(alpha = 1/rate).mean()
-
-        df['plus_di']=plus_di
-        df['minus_di']=minus_di
-        df['adx']=adx_smooth
-        return df
-
-    def get_sma(df, rate=20):
-        df[f'sma_{rate}']=df['Close'].rolling(rate).mean()
-        return df
-
-    def get_bollinger_bands(df, rate=20):
-        df = get_sma(df, rate) # <-- Get SMA for 20 days
-        std = df['Close'].rolling(rate).std() # <-- Get rolling standard deviation for 20 days
-        df['bollinger_up'] = df[f'sma_{rate}'] + std * 2 # Calculate top band
-        df['bollinger_down'] = df[f'sma_{rate}'] - std * 2 # Calculate bottom band
-        return df
-    
-    def getMFI(data):
-        data['typical_price']=(data['High']+data['Low']+data['Close'])/3
-        data['money_flow']=data['typical_price']*data['Volume']
-        data['money_flow_sgn']=np.sign((data['money_flow']-data['money_flow'].shift(1)))
-        data['money_flow_sgn']=data['money_flow_sgn']*data['money_flow']
-        data['money_flow_gain']=data['money_flow_sgn'].rolling(14).apply(lambda x:((x>0)*x).sum(),raw=True)
-        data['money_flow_loss']=data['money_flow_sgn'].rolling(14).apply(lambda x:((x<0)*x).sum(),raw=True)
-        data['money_flow_index']=(100 - (100 / (1 + (data['money_flow_gain'] / abs(data['money_flow_loss'])))))
-        return data
-    
-    def getDecision(data):
-        info_row=data.iloc[-1]
-        di=info_row['plus_di']>info_row['minus_di']
-        ndi=info_row['plus_di']<info_row['minus_di']
-        adx=info_row['adx']>20
-        
-        decision='undertermined'
-        if di and adx and (info_row['money_flow_index']<50):
-            decision='long'
-        elif di and adx and (info_row['money_flow_index']<20):
-            decision='buy now'
-        elif ndi and adx and (info_row['money_flow_index']>50):
-            decision='short'
-        elif ndi and adx and (info_row['money_flow_index']>80):
-            decision='sell all'
-        return decision
-
-    data=get_adx(data)
-    data=get_bollinger_bands(data)
-    data=getMFI(data)
-    data.dropna(inplace=True)
-    data['ticker']=ticker
-    data.reset_index(inplace=True)
-    decision=getDecision(data)
-    return (data, decision)
-
-tickers=[
-    'VOO',
-    'QQQ',
-    'AAPL',
-    'MSFT',
-    'TSLA',
-]
-decisions={}
-
-data=[]
-for ticker in tickers:
-    d, di=main(ticker)
-    data.append(d)
-    decisions[ticker]=di
-data=pd.concat(data)
+data_lock=threading.Lock()
+data, decisions=get_data()
+data_store={'data': data, 'decisions': decisions}
+def fetch_and_store_data(ticker):
+    data, decisions = get_data(ticker)
+    return data, decisions
 
 
 app=dash.Dash()
-
 app_layout=[]
+app_layout.append(
+    html.Link(rel='stylesheet', href='/assets/style.css')
+)
 app_layout.append(
     html.Div(
         html.H2(
@@ -128,12 +46,11 @@ app_layout.append(
         ),style={'padding-left':20}
     )
 )
+app_layout.append(dcc.Store(id='data-store'))
 app_layout.append(
     html.Div(
-        dcc.Dropdown(id='ticker',options=[
-            {'label':tick,'value':tick} for tick in tickers
-        ],value='VOO'),
-        style={'width':'10%','padding-left':'1000px'}
+        dcc.Input(id='ticker', type='text', value='VOO', placeholder="Enter a stock ticker:"),
+        style={'width': '20%', 'padding-left': '40px'}
     )
 )
 app_layout.append(
@@ -162,62 +79,93 @@ app_layout.append(
     ])
 )
 
-app.layout=html.Div(
-    app_layout
+app.layout = html.Div(
+    app_layout,
+    style={'backgroundColor': '#f5f5f5'}
 )
 
 
 # callback functions:
+# @app.callback(
+#     Output('data-store', 'data'),
+#     [Input('ticker', 'value')]
+# )
+# def update_global_data(ticker):
+#     with data_lock:
+#         fetch_and_store_data(ticker)
+#     data_store={'data': data, 'decisions': decisions}
+#     print(data_store)
+#     return data_store
+
+
+@app.callback(
+    Output('data-store', 'data'),
+    [Input('ticker', 'value')]
+)
+def update_global_data(ticker):
+    with data_lock:
+        global data, decisions, data_store
+        data, decisions = fetch_and_store_data(ticker)
+        data_store = {'data': data, 'decisions': decisions}
+    return data_store
+
 @app.callback(
     Output('title','children'),
     [Input('ticker','value')]
 )
 def getTitle(value):
-    return f'Technical Analysis for {value}'
+    title=f'Technical Analysis for {value}'
+    return title
+
 
 @app.callback(
-    Output('subtitle','children'),
-    [Input('ticker','value')]
+    Output('subtitle', 'children'),
+    [Input('ticker', 'value')]  # Added the data-store input here
 )
-def getSubtitle(value):
-    return f'suggestion: {decisions[value]}'
+def getSubtitle(value):  # Added store_data parameter here
+    with data_lock:
+        print(data_store)
+        decisions = data_store['decisions']
+        decision = f'suggestion: {decisions[value]}'
+    return decision
 
 @app.callback(
     Output('bollinger','figure'),
     [Input('ticker','value')]
 )
 def getBollingerBand(value):
-    subset=data[data.ticker==value]
-    traces=[
-        go.Scatter(
-            x=pd.to_datetime(subset['Date'].values),
-            y=subset['Close'].values,
-            name='Close',
-            hovertemplate="%{x:%Y}@%{y:$,.2f}"
-        ),
-        go.Scatter(
-            x=pd.to_datetime(subset['Date'].values),
-            y=subset['sma_20'].values,
-            name='smoothing 20',
-            line={'color':'red'},
-            hovertemplate="%{x:%Y}@%{y:$,.2f}"
-        ),
-        go.Scatter(
-            x=pd.to_datetime(subset['Date'].values),
-            y=subset['bollinger_down'].values,
-            line = dict(color='orange'),
-            name='Bollinger Lower',
-            hovertemplate="%{x:%Y}@%{y:$,.2f}"
-        ),
-        go.Scatter(
-            x=pd.to_datetime(subset['Date'].values),
-            y=subset['bollinger_up'].values,
-            fill='tonexty',
-            line = dict(color='orange'),
-            name='Bollinger Upper',
-            hovertemplate="%{x:%Y}@%{y:$,.2f}"
-        ),
-    ]
+    with data_lock:
+        subset=data[data.ticker==value]
+        traces=[
+            go.Scatter(
+                x=pd.to_datetime(subset['Date'].values),
+                y=subset['Close'].values,
+                name='Close',
+                hovertemplate="%{x:%Y}@%{y:$,.2f}"
+            ),
+            go.Scatter(
+                x=pd.to_datetime(subset['Date'].values),
+                y=subset['sma_20'].values,
+                name='smoothing 20',
+                line={'color':'red'},
+                hovertemplate="%{x:%Y}@%{y:$,.2f}"
+            ),
+            go.Scatter(
+                x=pd.to_datetime(subset['Date'].values),
+                y=subset['bollinger_down'].values,
+                line = dict(color='orange'),
+                name='Bollinger Lower',
+                hovertemplate="%{x:%Y}@%{y:$,.2f}"
+            ),
+            go.Scatter(
+                x=pd.to_datetime(subset['Date'].values),
+                y=subset['bollinger_up'].values,
+                fill='tonexty',
+                line = dict(color='orange'),
+                name='Bollinger Upper',
+                hovertemplate="%{x:%Y}@%{y:$,.2f}"
+            ),
+        ]
     
     return {'data':traces,'layout':go.Layout(
         title='Bollinger Band',
@@ -234,27 +182,28 @@ def getBollingerBand(value):
     [Input('ticker','value')]
 )
 def getADX(value):
-    subset=data[data.ticker==value]
-    traces=[
-        go.Scatter(
-            x=pd.to_datetime(subset['Date'].values),
-            y=subset['plus_di'].values,
-            name='+dm',
-            hovertemplate="%{x:%Y}@%{y:$,.2f}"
-        ),
-        go.Scatter(
-            x=pd.to_datetime(subset['Date'].values),
-            y=subset['minus_di'].values,
-            name='-dm',
-            hovertemplate="%{x:%Y}@%{y:$,.2f}"
-        ),
-        go.Scatter(
-            x=pd.to_datetime(subset['Date'].values),
-            y=subset['adx'].values,
-            name='adx',
-            hovertemplate="%{x:%Y}@%{y:$,.2f}"
-        ),
-    ]
+    with data_lock:
+        subset=data[data.ticker==value]
+        traces=[
+            go.Scatter(
+                x=pd.to_datetime(subset['Date'].values),
+                y=subset['plus_di'].values,
+                name='+dm',
+                hovertemplate="%{x:%Y}@%{y:$,.2f}"
+            ),
+            go.Scatter(
+                x=pd.to_datetime(subset['Date'].values),
+                y=subset['minus_di'].values,
+                name='-dm',
+                hovertemplate="%{x:%Y}@%{y:$,.2f}"
+            ),
+            go.Scatter(
+                x=pd.to_datetime(subset['Date'].values),
+                y=subset['adx'].values,
+                name='adx',
+                hovertemplate="%{x:%Y}@%{y:$,.2f}"
+            ),
+        ]
     
     return {'data':traces,'layout':go.Layout(
         title='ADX',
@@ -270,16 +219,17 @@ def getADX(value):
     [Input('ticker','value')]
 )
 def getMFI(value):
-    subset=data[data.ticker==value]
-    traces=[
-        go.Scatter(
-            x=pd.to_datetime(subset['Date'].values),
-            y=subset['money_flow_index'].values,
-            name='MFI',
-            hovertemplate="%{x:%Y}@%{y:$,.2f}",
-            marker_color='lightgreen'
-        ),
-    ]
+    with data_lock:
+        subset=data[data.ticker==value]
+        traces=[
+            go.Scatter(
+                x=pd.to_datetime(subset['Date'].values),
+                y=subset['money_flow_index'].values,
+                name='MFI',
+                hovertemplate="%{x:%Y}@%{y:$,.2f}",
+                marker_color='lightgreen'
+            ),
+        ]
     
     return {'data':traces,'layout':go.Layout(
         title='MFI',
@@ -295,23 +245,24 @@ def getMFI(value):
     [Input('ticker','value')]
 )
 def getFlow(value):
-    subset=data[data.ticker==value]
-    traces=[
-        go.Bar(
-            x=pd.to_datetime(subset['Date'].values),
-            y=subset['money_flow_gain'].values,
-            name='Gain Volume',
-            hovertemplate="%{x:%Y}@%{y:$,.2f}",
-            marker_color='limegreen'
-        ),
-        go.Bar(
-            x=pd.to_datetime(subset['Date'].values),
-            y=subset['money_flow_loss'].values,
-            name='Loss Volume',
-            hovertemplate="%{x:%Y}@%{y:$,.2f}",
-            marker_color='lightsalmon'
-        ),
-    ]
+    with data_lock:
+        subset=data[data.ticker==value]
+        traces=[
+            go.Bar(
+                x=pd.to_datetime(subset['Date'].values),
+                y=subset['money_flow_gain'].values,
+                name='Gain Volume',
+                hovertemplate="%{x:%Y}@%{y:$,.2f}",
+                marker_color='limegreen'
+            ),
+            go.Bar(
+                x=pd.to_datetime(subset['Date'].values),
+                y=subset['money_flow_loss'].values,
+                name='Loss Volume',
+                hovertemplate="%{x:%Y}@%{y:$,.2f}",
+                marker_color='lightsalmon'
+            ),
+        ]
     
     return {'data':traces,'layout':go.Layout(
         title='Money Flow Volume',
@@ -324,4 +275,4 @@ def getFlow(value):
 
 
 if __name__ == '__main__':
-    app.run_server(host='0.0.0.0', port=8050, debug=True)
+    app.run_server(host='0.0.0.0', port=8050, debug=False)
